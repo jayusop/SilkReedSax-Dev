@@ -1,0 +1,273 @@
+cmake_minimum_required(VERSION 3.22)
+
+# ---- Target CPU (must be set before project()) ---------------------------------
+# Apple Silicon (arm64), Intel (x86_64), or universal (both in one binary).
+#   Xcode generator : one project with the configurations
+#                     Debug_AppleSilicon / Release_AppleSilicon   -> arm64
+#                     Debug_Intel        / Release_Intel          -> x86_64
+#                     Debug_Universal    / Release_Universal      -> arm64 + x86_64
+#   Other generators: -DSILKREED_ARCH=arm64 | x86_64 | universal | native (native = this Mac's CPU)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
+execute_process(COMMAND uname -m OUTPUT_VARIABLE SILKREED_HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+option(SILKREED_INSTALL_PLUGINS
+       "Copy built VST3/AU into ~/Library/Audio/Plug-Ins when they are for this Mac's CPU" ON)
+
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+    set(SILKREED_DEBUG_CONFIGS   Debug_AppleSilicon Debug_Intel Debug_Universal)
+    set(SILKREED_RELEASE_CONFIGS Release_AppleSilicon Release_Intel Release_Universal)
+    set(CMAKE_CONFIGURATION_TYPES Debug_AppleSilicon Release_AppleSilicon Debug_Intel Release_Intel
+                                  Debug_Universal Release_Universal
+        CACHE STRING "Build configurations (CPU is chosen per configuration)" FORCE)
+    set(CMAKE_OSX_ARCHITECTURES "" CACHE STRING "Set per configuration (see ARCHS below)" FORCE)
+    # CPU of the configuration being built, usable in generator expressions
+    set(SILKREED_ARCH_GENEX
+        "$<IF:$<CONFIG:Debug_Intel,Release_Intel>,x86_64,$<IF:$<CONFIG:Debug_Universal,Release_Universal>,universal,arm64>>")
+    message(STATUS "SilkReed: Xcode configurations -> Apple Silicon (arm64) / Intel (x86_64) / Universal, host ${SILKREED_HOST_ARCH}")
+else()
+    set(SILKREED_ARCH "native" CACHE STRING "Target CPU: arm64 | x86_64 | universal | native")
+    set_property(CACHE SILKREED_ARCH PROPERTY STRINGS arm64 x86_64 universal native)
+    if(SILKREED_ARCH STREQUAL "native")
+        set(_arch "${SILKREED_HOST_ARCH}")
+        set(_osx_archs "${SILKREED_HOST_ARCH}")
+    elseif(SILKREED_ARCH STREQUAL "arm64" OR SILKREED_ARCH STREQUAL "x86_64")
+        set(_arch "${SILKREED_ARCH}")
+        set(_osx_archs "${SILKREED_ARCH}")
+    elseif(SILKREED_ARCH STREQUAL "universal")
+        set(_arch "universal")
+        set(_osx_archs "arm64;x86_64")
+    else()
+        message(FATAL_ERROR "SILKREED_ARCH must be arm64, x86_64, universal or native (got '${SILKREED_ARCH}').")
+    endif()
+    set(CMAKE_OSX_ARCHITECTURES "${_osx_archs}" CACHE STRING "Target architectures" FORCE)
+    set(SILKREED_ARCH_GENEX "${_arch}")
+    message(STATUS "SilkReed: target CPU ${_arch} (${_osx_archs}), host ${SILKREED_HOST_ARCH}")
+endif()
+
+project(SilkReedSax VERSION 1.0.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---- Xcode CPU configurations ------------------------------------------------------
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+    # JUCE decides DEBUG=1 / NDEBUG=1 from this property (must precede add_subdirectory(JUCE))
+    set_property(GLOBAL PROPERTY DEBUG_CONFIGURATIONS ${SILKREED_DEBUG_CONFIGS})
+    foreach(_cfg ${CMAKE_CONFIGURATION_TYPES})
+        string(TOUPPER "${_cfg}" _CFG)
+        if(_cfg IN_LIST SILKREED_DEBUG_CONFIGS)
+            set(_base DEBUG)
+        else()
+            set(_base RELEASE)
+        endif()
+        foreach(_kind C_FLAGS CXX_FLAGS EXE_LINKER_FLAGS SHARED_LINKER_FLAGS MODULE_LINKER_FLAGS STATIC_LINKER_FLAGS)
+            set(CMAKE_${_kind}_${_CFG} "${CMAKE_${_kind}_${_base}}" CACHE STRING "" FORCE)
+        endforeach()
+    endforeach()
+endif()
+
+# ---- Xcode support -----------------------------------------------------------
+# Generate with:  cmake -B build-xcode -G Xcode   (or ./xcode.sh)
+set(CMAKE_XCODE_GENERATE_SCHEME ON)                 # one scheme per target (Run/Debug in Xcode)
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)        # JUCE helper targets go into folders
+set(SILKREED_DEBUG_HOST "" CACHE FILEPATH "Host app Xcode launches when you Run the AU/VST3 schemes (e.g. Logic Pro). Empty = auto-detect")
+if(SILKREED_DEBUG_HOST STREQUAL "")
+    foreach(_host "/Applications/Logic Pro.app" "/Applications/Logic Pro Creator Studio.app"
+                  "/Applications/REAPER.app" "/Applications/GarageBand.app")
+        if(EXISTS "${_host}")
+            set(SILKREED_DEBUG_HOST "${_host}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/JUCE/CMakeLists.txt")
+    message(FATAL_ERROR "JUCE not found. Run ./setup.sh first.")
+endif()
+add_subdirectory(ThirdParty/JUCE)
+
+option(SILKREED_BUILD_TOOLS "Build the offline render / icon / snapshot tool" ON)
+
+# ---- Embedded resources -------------------------------------------------------
+# THIRD_PARTY_NOTICES.txt is generated by Tools/make_notices.py from the licences inside ThirdParty/JUCE
+juce_add_binary_data(SilkReedAssets SOURCES Resources/Icon.svg THIRD_PARTY_NOTICES.txt)
+
+# ---- Plugin ------------------------------------------------------------------
+juce_add_plugin(SilkReedSax
+    PRODUCT_NAME "SilkReed Sax"
+    COMPANY_NAME "SilkReed Audio"
+    BUNDLE_ID "com.silkreed.sax"
+    VERSION 1.0.0
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Icon_1024.png"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Icon_512.png"
+    IS_SYNTH TRUE
+    NEEDS_MIDI_INPUT TRUE
+    NEEDS_MIDI_OUTPUT FALSE
+    IS_MIDI_EFFECT FALSE
+    EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+    COPY_PLUGIN_AFTER_BUILD FALSE   # signing/installing is done by Tools/post_build.sh
+    PLUGIN_MANUFACTURER_CODE Slkr
+    PLUGIN_CODE SRsx
+    FORMATS VST3 AU Standalone
+    VST3_CATEGORIES Instrument Synth
+    AU_MAIN_TYPE kAudioUnitType_MusicDevice
+    MICROPHONE_PERMISSION_ENABLED FALSE)
+
+set(SILKREED_CORE_SOURCES
+    Source/SaxEngine.cpp
+    Source/FXChain.cpp
+    Source/Parameters.cpp
+    Source/Presets.cpp
+    Source/PluginProcessor.cpp
+    Source/PluginEditor.cpp
+    Source/SilkLookAndFeel.cpp)
+
+set(SILKREED_HEADERS
+    Source/SaxProfiles.h
+    Source/SaxEngine.h
+    Source/FXChain.h
+    Source/Parameters.h
+    Source/Presets.h
+    Source/PluginProcessor.h
+    Source/PluginEditor.h
+    Source/SilkLookAndFeel.h)
+
+target_sources(SilkReedSax PRIVATE ${SILKREED_CORE_SOURCES} ${SILKREED_HEADERS} Resources/Icon.svg)
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${SILKREED_CORE_SOURCES} ${SILKREED_HEADERS} Resources/Icon.svg)
+set_source_files_properties(Resources/Icon.svg PROPERTIES HEADER_FILE_ONLY TRUE)
+
+target_compile_definitions(SilkReedSax PUBLIC
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_VST3_CAN_REPLACE_VST2=0
+    SILKREED_VERSION_STRING=${PROJECT_VERSION}
+    JUCE_USE_FLAC=0              # audio-file codecs are not used: keep them out of the binary
+    JUCE_USE_OGGVORBIS=0)
+
+target_link_libraries(SilkReedSax
+    PRIVATE
+        SilkReedAssets
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_gui_extra
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_lto_flags
+        juce::juce_recommended_warning_flags)
+
+# ---- Release optimisation for the custom Xcode configurations -------------------
+# JUCE's recommended -O3 / LTO flags are tied to a configuration literally named "Release".
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+    string(JOIN "," _rel ${SILKREED_RELEASE_CONFIGS})
+    target_compile_options(SilkReedSax PUBLIC "$<$<CONFIG:${_rel}>:-O3;-flto>")
+    target_link_options(SilkReedSax PUBLIC "$<$<CONFIG:${_rel}>:-flto;LINKER:-weak_reference_mismatches,weak>")
+endif()
+
+# ---- Sign every bundle; install it when it is for this Mac's CPU ---------------------
+# Runs after JUCE's own post-build steps (e.g. VST3 moduleinfo.json).
+set(_install_flag "$<IF:$<BOOL:${SILKREED_INSTALL_PLUGINS}>,install,noinstall>")
+foreach(_t SilkReedSax_VST3 SilkReedSax_AU SilkReedSax_Standalone)
+    if(TARGET ${_t})
+        add_custom_command(TARGET ${_t} POST_BUILD
+            COMMAND /bin/sh "${CMAKE_CURRENT_SOURCE_DIR}/Tools/post_build.sh"
+                    "$<TARGET_BUNDLE_DIR:${_t}>" "${SILKREED_ARCH_GENEX}" "${_install_flag}"
+            COMMENT "Signing (and installing if for this CPU) $<TARGET_BUNDLE_DIR_NAME:${_t}>"
+            VERBATIM)
+    endif()
+endforeach()
+
+# ---- Licence notices inside every bundle (Contents/Resources), added before code signing
+set(SILKREED_NOTICES "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.txt")
+foreach(_t SilkReedSax_VST3 SilkReedSax_AU SilkReedSax_Standalone)
+    if(TARGET ${_t})
+        target_sources(${_t} PRIVATE "${SILKREED_NOTICES}")
+    endif()
+endforeach()
+set_source_files_properties("${SILKREED_NOTICES}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources HEADER_FILE_ONLY TRUE)
+
+# ---- Third-party warnings (JUCE 8.0.9 / VST3 SDK vs. the macOS 27 SDK) ----------
+# Scoped to the offending third-party files/targets only; our own code keeps every warning.
+# - juce_NSViewComponentPeer_mac.mm (via juce_gui_basics.mm): new NSEventTypeMouseCancelled enum
+#   value is not handled in a switch -> -Wswitch-enum.
+set(_juce_modules "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/JUCE/modules")
+foreach(_t SilkReedSax SilkReedTool)
+    if(TARGET ${_t})
+        set_source_files_properties("${_juce_modules}/juce_gui_basics/juce_gui_basics.mm"
+            TARGET_DIRECTORY ${_t} PROPERTIES COMPILE_OPTIONS "-Wno-switch-enum")
+    endif()
+endforeach()
+# - VST3 manifest helper (Steinberg SDK) uses std::wstring_convert, deprecated in libc++.
+if(TARGET SilkReedSax_vst3_helper)
+    target_compile_options(SilkReedSax_vst3_helper PRIVATE -Wno-deprecated-declarations)
+endif()
+# - juce_audio_processors_ara / _lv2_libs compile to empty objects (ARA and LV2 are disabled),
+#   so Xcode's libtool warns "has no symbols" when archiving the shared-code library.
+set_target_properties(SilkReedSax PROPERTIES XCODE_ATTRIBUTE_OTHER_LIBTOOLFLAGS "-no_warning_for_no_symbols")
+
+# Xcode: debug-friendly settings + host app for the plug-in schemes
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+    foreach(_t SilkReedSax SilkReedSax_VST3 SilkReedSax_AU SilkReedSax_Standalone)
+        if(TARGET ${_t})
+            set_target_properties(${_t} PROPERTIES
+                XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+                XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Manual"
+                FOLDER "SilkReed")
+            foreach(_cfg ${SILKREED_DEBUG_CONFIGS})
+                set_target_properties(${_t} PROPERTIES
+                    XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT[variant=${_cfg}] "dwarf"
+                    XCODE_ATTRIBUTE_GCC_OPTIMIZATION_LEVEL[variant=${_cfg}] "0")
+            endforeach()
+            foreach(_cfg ${SILKREED_RELEASE_CONFIGS})
+                set_target_properties(${_t} PROPERTIES
+                    XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT[variant=${_cfg}] "dwarf-with-dsym"
+                    XCODE_ATTRIBUTE_GCC_OPTIMIZATION_LEVEL[variant=${_cfg}] "3")
+            endforeach()
+        endif()
+    endforeach()
+    if(SILKREED_DEBUG_HOST)
+        foreach(_t SilkReedSax_VST3 SilkReedSax_AU)
+            if(TARGET ${_t})
+                set_target_properties(${_t} PROPERTIES XCODE_SCHEME_EXECUTABLE "${SILKREED_DEBUG_HOST}")
+            endif()
+        endforeach()
+        message(STATUS "SilkReed: AU/VST3 schemes will launch ${SILKREED_DEBUG_HOST}")
+    endif()
+endif()
+
+# ---- Developer tool: offline render, icon export, UI snapshot -----------------
+if(SILKREED_BUILD_TOOLS)
+    juce_add_console_app(SilkReedTool PRODUCT_NAME "SilkReedTool")
+    target_sources(SilkReedTool PRIVATE Tools/SilkReedTool.cpp ${SILKREED_CORE_SOURCES} ${SILKREED_HEADERS})
+    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES Tools/SilkReedTool.cpp)
+    set_target_properties(SilkReedTool PROPERTIES FOLDER "Tools"
+        XCODE_SCHEME_ARGUMENTS "render;${CMAKE_CURRENT_BINARY_DIR}/renders"
+        XCODE_SCHEME_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(SilkReedTool PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 SILKREED_STANDALONE_TOOL=1 JUCE_MODAL_LOOPS_PERMITTED=1
+        SILKREED_VERSION_STRING=${PROJECT_VERSION})
+    target_link_libraries(SilkReedTool
+        PRIVATE SilkReedAssets juce::juce_audio_utils juce::juce_audio_formats juce::juce_gui_extra
+        PUBLIC juce::juce_recommended_config_flags)
+endif()
+
+# ---- Xcode: CPU per configuration, applied to every target of the project -----------
+# (CMake writes ARCHS itself, so it has to be overridden per target, after all targets exist.)
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+    get_directory_property(_all_targets BUILDSYSTEM_TARGETS)
+    foreach(_t ${_all_targets})
+        get_target_property(_type ${_t} TYPE)
+        if(_type STREQUAL "INTERFACE_LIBRARY" OR _type STREQUAL "UTILITY")
+            continue()
+        endif()
+        foreach(_cfg ${CMAKE_CONFIGURATION_TYPES})
+            if(_cfg MATCHES "Intel$")
+                set_property(TARGET ${_t} PROPERTY XCODE_ATTRIBUTE_ARCHS[variant=${_cfg}] "x86_64")
+            elseif(_cfg MATCHES "Universal$")
+                set_property(TARGET ${_t} PROPERTY XCODE_ATTRIBUTE_ARCHS[variant=${_cfg}] "arm64 x86_64")
+            else()
+                set_property(TARGET ${_t} PROPERTY XCODE_ATTRIBUTE_ARCHS[variant=${_cfg}] "arm64")
+            endif()
+        endforeach()
+        set_property(TARGET ${_t} PROPERTY XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH "NO")
+    endforeach()
+endif()
